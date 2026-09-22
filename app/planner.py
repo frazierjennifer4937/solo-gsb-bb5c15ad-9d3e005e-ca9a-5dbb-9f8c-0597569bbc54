@@ -19,6 +19,11 @@ stored request without persisting anything, then solves a lexicographic
 objective — fewest waves first, then fewest services moved relative to the
 stored plan — encoded as one scaled linear objective, followed by the same
 canonicalization pass for determinism.
+
+The slack report (``service_latest_waves``) reuses the exact same wave
+model on the fixed horizon of a stored plan and maximizes each service's
+position independently, giving its latest feasible wave (and therefore how
+many waves it can move later without growing the wave count).
 """
 from __future__ import annotations
 
@@ -325,6 +330,55 @@ def schedule_waves(
         # Defensive: with horizon == n, waves of size 1 always work for DAGs.
         raise RuntimeError("Unexpected solver infeasibility without a wave window cap")
     return _to_output(result)
+
+
+def service_latest_waves(
+    services: list[str],
+    edges: list[tuple[str, str]],
+    fault_cliques: list[list[str]],
+    concurrency: int,
+    wave_count: int,
+    current_pos: dict[str, int],
+    settings: Settings,
+) -> tuple[dict[str, int], bool]:
+    """Latest feasible 0-based wave of each service within ``wave_count``.
+
+    The slack report answers, for every service, how many waves it can move
+    later without increasing the total wave count. For each service the same
+    deterministic wave model (dependencies, per-wave concurrency,
+    fault-domain anti-affinity) is rebuilt on the fixed horizon
+    ``0 .. wave_count - 1`` with that service's position maximized. The
+    stored assignment is feasible, so a solution always exists.
+
+    Returns ``(latest_pos, proven)``; ``proven`` is False when any
+    maximization only found a feasible (not proven-optimal) bound within the
+    time budget — the reported value is then a lower bound on the true slack.
+    """
+    latest: dict[str, int] = {}
+    proven = True
+    # Maximizing one position is usually instant; when proving optimality
+    # is hard (an infeasibility proof for every later wave), cap each solve
+    # so the report scales with the number of services and surface the
+    # unproven case via ``optimal=False`` (values stay valid lower bounds).
+    budget = min(1.0, settings.solver_time_limit_seconds)
+    for service in sorted(services):
+        model, pos, max_pos = _build_wave_model(
+            services, edges, fault_cliques, wave_count, concurrency
+        )
+        model.Add(max_pos == wave_count - 1)
+        model.Maximize(pos[service])
+        model.AddHint(max_pos, wave_count - 1)
+        for s, w in current_pos.items():
+            model.AddHint(pos[s], w)
+        solver = _make_solver(settings, time_limit=budget)
+        status = solver.Solve(model)
+        if status not in FEASIBLE_STATUSES:
+            # Defensive: the stored assignment is feasible on this horizon.
+            raise RuntimeError("Unexpected solver infeasibility while computing slack")
+        if status != cp_model.OPTIMAL:
+            proven = False
+        latest[service] = int(solver.Value(pos[service]))
+    return latest, proven
 
 
 # ---------------------------------------------------------------------------

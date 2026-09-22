@@ -11,7 +11,7 @@ from dataclasses import dataclass
 # API/container version, surfaced in exported bundle metadata. Kept here so
 # main.py, docker-compose.yml and the bundle module never drift apart.
 SERVICE_NAME = "release-wave-planner"
-SERVICE_VERSION = "1.5.0"
+SERVICE_VERSION = "1.6.0"
 
 
 def _get_float(name: str, default: float) -> float:

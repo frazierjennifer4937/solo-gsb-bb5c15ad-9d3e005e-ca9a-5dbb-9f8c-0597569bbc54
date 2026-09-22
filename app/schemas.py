@@ -464,6 +464,58 @@ class TimelineAuditResult(BaseModel):
     )
 
 
+class ServiceSlack(BaseModel):
+    """How far one service can move later without adding a wave."""
+
+    service: str = Field(..., description="Service id")
+    current_wave: int = Field(
+        ..., ge=1, description="Wave of the service in the stored plan (1-based)"
+    )
+    latest_wave: int = Field(
+        ...,
+        ge=1,
+        description="Latest feasible wave (1-based) within the stored wave count, "
+        "given dependencies, concurrency and fault-domain constraints",
+    )
+    slack: int = Field(
+        ...,
+        ge=0,
+        description="Waves the service can move later (latest_wave - current_wave); "
+        "zero marks a critical service",
+    )
+    constrained_downstream: list[str] = Field(
+        ...,
+        description="Transitive downstream services that (directly or indirectly) "
+        "depend on this service and are themselves critical (slack zero); "
+        "empty for non-critical services",
+    )
+
+
+class SlackReport(BaseModel):
+    """Outcome of a read-only service-slack report; never persisted."""
+
+    plan_id: int
+    name: str | None
+    wave_count: int = Field(
+        ..., description="Stored plan wave count; the report never exceeds it"
+    )
+    max_concurrency: int = Field(
+        ..., description="Per-wave cap inherited from the stored plan"
+    )
+    optimal: bool = Field(
+        ...,
+        description="True when every service's latest feasible wave is proven by "
+        "the solver; false only under the solver time limit, in which case the "
+        "reported slack values are lower bounds",
+    )
+    services: list[ServiceSlack] = Field(
+        ..., description="Per-service slack, sorted by service id"
+    )
+    critical_services: list[str] = Field(
+        ..., description="Services with zero slack, sorted"
+    )
+
+
 # ---- Error envelope --------------------------------------------------------
 
 

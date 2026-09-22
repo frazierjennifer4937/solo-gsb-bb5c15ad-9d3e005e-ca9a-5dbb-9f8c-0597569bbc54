@@ -11,6 +11,9 @@
 `POST /plans/{id}/timeline-audit` 对发布后实际上报的逐服务执行时间线做审计：按
 已存波次与依赖校验启动顺序、返回每条违规与重叠毫秒数，并给出各波实际耗时与依赖
 DAG 上按服务实际耗时加权的关键链（只读，不改方案）。
+`GET /plans/{id}/slack-report` 只读计算当前最优波次方案中每个服务的**服务松弛度**
+（不增加总波数、仍满足依赖/并发/故障域约束下可向后移动的最大波数），列出零松弛
+关键服务及受其约束的关键下游；结果即时计算、不落库。
 `GET /plans/{id}/bundle` 把请求约束、求解结果与版本元数据按规范 JSON 固定排序
 导出为带 SHA-256 的离线归档；`POST /plans/import` 校验摘要、schema、依赖/故障域
 引用与结果一致性后以事务写入新方案（波次结果原样保留、不重新求解），重复摘要
@@ -446,6 +449,70 @@ schema 问题返回 `validation_error`。零时长窗口（`started_at == finish
 合法。审计为只读操作：重复请求得到相同结果（且与请求列表顺序无关），
 方案不存在返回 404。
 
+## 服务松弛度报告（GET /plans/{id}/slack-report）
+
+对一个**当前最优波次方案**，只读回答两个问题：每个服务在**不增加总波次数**、
+仍满足全部依赖、每波并发上限与故障域反亲和的前提下，最多能**向后移动几个波**？
+哪些服务**一个波都不能动**（零松弛关键服务），它们又卡住了哪些下游？
+
+- **服务松弛度（slack）= 最晚可行波次 − 当前波次**。计算「最晚可行波次」时，
+  求解器在固定波数上界（当前波总数）内**最大化该服务的波次位置**：其它服务可以
+  任意腾挪到更早的波次为它让路（等价于项目调度中的「总时差 / total float」），
+  但依赖必须严格更早、每波不超过并发上限、同故障域成员不同波。
+- **关键服务**：`slack = 0` 的服务。它由某条约束（依赖链长度、满载波次的容量、
+  故障域反亲和）钉死在当前波次。
+- **受其约束的下游（`constrained_downstream`）**：沿依赖边可达的**下游服务中
+  同样为关键服务**者（传递闭包，即关键链上钉在它后面的那段）。
+- 与规划使用**同一个确定性求解器**（CP-SAT 固定随机种子、单搜索线程、以当前
+  方案作为初始解提示），同一方案永远得到相同报告。**只读、即时计算、不落库**，
+  也不改变已存波次。
+
+```bash
+curl http://localhost:8000/plans/1/slack-report
+```
+
+承接上面 `payment-platform` 示例（存储波次为
+`[db] → [auth] → [api] → [cache, web]`，4 个波，cap 2，`db`/`cache` 同故障域）：
+依赖链 `db → auth → api → web` 恰好占满 4 个波，`cache` 又被满载的最后一波与
+故障域钉在第 4 波，因此 5 个服务全部为零松弛关键服务：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "wave_count": 4,
+  "max_concurrency": 2,
+  "optimal": true,
+  "services": [
+    {"service": "api",   "current_wave": 3, "latest_wave": 3, "slack": 0, "constrained_downstream": ["web"]},
+    {"service": "auth",  "current_wave": 2, "latest_wave": 2, "slack": 0, "constrained_downstream": ["api", "web"]},
+    {"service": "cache", "current_wave": 4, "latest_wave": 4, "slack": 0, "constrained_downstream": []},
+    {"service": "db",    "current_wave": 1, "latest_wave": 1, "slack": 0, "constrained_downstream": ["api", "auth", "web"]},
+    {"service": "web",   "current_wave": 4, "latest_wave": 4, "slack": 0, "constrained_downstream": []}
+  ],
+  "critical_services": ["api", "auth", "cache", "db", "web"]
+}
+```
+
+有富余容量时才会出现正松弛。例如依赖 `b → a` 加三个独立服务 `c d e`、cap 3
+的最优方案为 `[a, c] → [b, d, e]`（2 波）：`a` 后移会把 `b` 顶到第 3 波，故
+`a`、`b` 为关键服务；独立服务 `c` 可从第 1 波挪到第 2 波（`slack=1`），而
+`d`、`e` 已在满载的最后一波，`slack=0`。纯故障域场景 `[a] → [b] → [c]`
+（三成员反亲和、cap 3）中，`a`、`b` 可分别后移 2、1 个波，只有 `c` 是关键
+服务。
+
+| 字段 | 含义 |
+| --- | --- |
+| `services[].current_wave` | 该服务在已存方案中的波次（1 起始） |
+| `services[].latest_wave` | 在波数不超过 `wave_count` 时它能占据的最晚可行波次（1 起始） |
+| `services[].slack` | `latest_wave - current_wave`，可向后移动的最大波数；0 即关键服务 |
+| `services[].constrained_downstream` | 传递可达且同样零松弛的下游服务（按 id 排序）；非关键服务恒为 `[]` |
+| `critical_services` | 全部零松弛关键服务（按 id 排序） |
+| `optimal` | 每个服务的最晚可行波次都被求解器证明时为 `true`；仅在触发求解时间上限时为 `false`，此时报告的松弛值是真实松弛的**下界** |
+
+松弛度始终在**已存波次结果**上计算（导入恢复的非最少波方案也按其存储波数上界
+评估），`GET` 请求无请求体；方案不存在返回与其它只读接口一致的 404 结构。
+
 ## 离线归档导出（GET /plans/{id}/bundle）
 
 把一个已存方案导出为**离线归档包（bundle）**，可跨实例搬运或存档。归档为只读
@@ -502,7 +569,7 @@ curl http://localhost:8000/plans/1/bundle
     "meta": {
       "format": "release-wave-plan-bundle",
       "format_version": "1.0",
-      "service": {"name": "release-wave-planner", "version": "1.5.0"}
+      "service": {"name": "release-wave-planner", "version": "1.6.0"}
     }
   },
   "provenance": {
@@ -634,6 +701,7 @@ curl -X POST http://localhost:8000/plans/import \
 | POST | `/plans/{id}/gate` | 执行门禁（只读）：上报已完成/失败服务，返回最早可执行波次、可执行与阻塞服务及每项可定位原因；输入冲突统一 422 |
 | POST | `/plans/{id}/rollback-preview` | 回滚波次预览（只读）：上报当前已上线服务，按逆序约束、原并发上限与故障域反亲和生成波次最少且顺序确定的回滚波；上线集合违反依赖闭包时 422 并定位缺失前置 |
 | POST | `/plans/{id}/timeline-audit` | 实际执行时间线审计（只读）：逐服务上报实际起止时间，校验前一波屏障与直接依赖，返回每条违规（服务/约束对象/阻塞服务/重叠毫秒）、各波实际耗时与按服务耗时加权的依赖 DAG 关键链；覆盖缺失、重复、时间倒置或未知服务 422 |
+| GET | `/plans/{id}/slack-report` | 服务松弛度报告（只读、不落库）：同一确定性求解器给出每个服务在不增加总波数下可后移的最大波数（slack）、最晚可行波次，以及零松弛关键服务与其受约束的关键下游；方案不存在 404 |
 | GET | `/plans/{id}/bundle` | 离线归档导出（只读）：规范 JSON 的请求约束 + 求解结果 + 版本元数据，附 `sha256` 与溯源信息；方案不存在 404 |
 | POST | `/plans/import` | 离线归档导入：先校验摘要、格式/schema、依赖/故障域引用与结果一致性，再事务写入新方案（波次原样保留、不重新求解）；新方案 201，重复摘要幂等 200（`reused=true`），任何校验失败 422 且零写入 |
 | GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
@@ -679,14 +747,15 @@ app/
   schemas.py    # 请求/响应模型与错误结构
   errors.py     # 结构化规划异常
   graph.py      # 依赖图：环检测（Tarjan SCC）、关键路径
-  planner.py    # CP-SAT 建模、两阶段求解、变更模拟、不可行诊断
+  planner.py    # CP-SAT 建模、两阶段求解、变更模拟、不可行诊断、逐服务最晚可行波
   gate.py       # 执行门禁：逐波可执行判定、失败递归传播、进度一致性校验
   rollback.py   # 回滚预览：上线集合依赖闭包校验、反向边回滚波次生成
   audit.py      # 执行时间线审计：波次/依赖顺序校验、违规重叠毫秒、实际耗时与加权关键链
+  slack.py      # 服务松弛度报告：逐服务最晚可行波（slack）、零松弛关键服务与关键下游
   bundle.py     # 离线归档：规范 JSON/SHA-256、导出组装、导入校验（摘要/schema/引用/结果一致性）
   db.py         # SQLite 初始化与 CRUD（含 bundle_sha256 幂等键与事务导入）
   main.py       # FastAPI 路由、启动建表、异常处理
-tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/归档/确定性）
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/松弛度/归档/确定性）
 Dockerfile
 docker-compose.yml
 requirements.txt
