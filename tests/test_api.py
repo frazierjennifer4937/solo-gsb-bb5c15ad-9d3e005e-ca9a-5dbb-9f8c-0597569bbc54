@@ -509,6 +509,192 @@ def test_simulate_is_deterministic(client):
 
 
 # ---------------------------------------------------------------------------
+# GET /plans/{id}/slack-report
+# ---------------------------------------------------------------------------
+
+
+def test_slack_report_dependency_chain_is_all_critical(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]] — every service sits on the 3-wave
+    # critical path, so every slack is 0 and the tight dependency edges form
+    # the constrained-downstream lists.
+    plan = _create_plan(client)
+    r = client.get(f"/plans/{plan['id']}/slack-report")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["wave_count"] == 3
+    assert body["optimal"] is True
+    assert [s["service"] for s in body["services"]] == ["a", "b", "c", "d"]
+    assert {s["service"]: s for s in body["services"]}["a"]["wave"] == 1
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+    assert all(
+        s["latest_wave"] == s["wave"] for s in body["services"]
+    )
+    critical = {x["service"]: x for x in body["critical_services"]}
+    assert set(critical) == {"a", "b", "c", "d"}
+    assert critical["a"]["constrained_downstream"] == ["b", "c", "d"]
+    assert critical["b"]["constrained_downstream"] == ["d"]
+    assert critical["c"]["constrained_downstream"] == ["d"]
+    assert critical["d"]["constrained_downstream"] == []
+    for item in body["critical_services"]:
+        stored_wave = next(
+            w["index"]
+            for w in plan["waves"]
+            if item["service"] in w["services"]
+        )
+        assert item["wave"] == stored_wave
+
+
+def test_slack_report_independent_services_have_capacity_slack(client):
+    # Four independent services, cap 2: [[a, b], [c, d]]. Wave-1 members can
+    # each move into wave 2 (leaving capacity behind), wave-2 members cannot
+    # move later, so c and d are the only critical services.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"], ["c", "d"]]
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    slack = {s["service"]: s for s in body["services"]}
+    assert slack["a"] == {
+        "service": "a", "wave": 1, "latest_wave": 2, "slack_waves": 1
+    }
+    assert slack["b"]["slack_waves"] == 1
+    assert slack["c"]["slack_waves"] == 0
+    assert slack["d"]["slack_waves"] == 0
+    assert [x["service"] for x in body["critical_services"]] == ["c", "d"]
+    assert all(x["constrained_downstream"] == [] for x in body["critical_services"])
+
+
+def test_slack_report_single_wave_everything_critical(client):
+    # One wave cannot grow, so nobody can move: all services are critical.
+    plan = _create_plan(client, {"services": ["a", "b"], "max_concurrency": 2})
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    assert body["wave_count"] == 1
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+    assert [x["service"] for x in body["critical_services"]] == ["a", "b"]
+
+
+def test_slack_report_fault_domain_member_can_swap(client):
+    # Independent a, b, c with a and b sharing a fault domain, cap 3:
+    # [[a, c], [b]]. a can move to wave 2 while b shifts forward (they just
+    # have to differ), b and c are pinned to the last wave.
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "z", "services": ["a", "b"]}],
+        },
+    )
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    slack = {s["service"]: s for s in body["services"]}
+    assert slack["a"]["slack_waves"] == 1
+    assert slack["b"]["slack_waves"] == 0
+    assert slack["c"]["slack_waves"] == 0
+    assert [x["service"] for x in body["critical_services"]] == ["b", "c"]
+
+
+def test_slack_report_positive_slack_tight_successor_is_excluded(client):
+    # Chain a -> b -> c (3 waves minimum) with independent d, e, cap 2.
+    # The canonical plan is [[a], [b, d], [c, e]]: a -> d is a tight edge
+    # (waves 1 -> 2) but d itself has slack 1, so d must NOT appear in a's
+    # constrained downstream; only the zero-slack chain b, c does.
+    payload = {
+        "services": ["a", "b", "c", "d", "e"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 2,
+    }
+    plan = _create_plan(client, payload)
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    slack = {s["service"]: s["slack_waves"] for s in body["services"]}
+    assert slack == {"a": 0, "b": 0, "c": 0, "d": 1, "e": 0}
+    critical = {x["service"]: x for x in body["critical_services"]}
+    assert set(critical) == {"a", "b", "c", "e"}
+    assert critical["a"]["constrained_downstream"] == ["b", "c"]
+    assert critical["b"]["constrained_downstream"] == ["c"]
+    assert critical["c"]["constrained_downstream"] == []
+    assert critical["e"]["constrained_downstream"] == []
+
+
+def test_slack_report_payment_example(client):
+    # README scenario: [db] -> [auth] -> [api] -> [cache, web]
+    # (web -> api -> {auth,db}, auth -> db; db/cache share az-a, cap 2).
+    payload = {
+        "name": "payment-platform",
+        "services": ["web", "api", "auth", "db", "cache"],
+        "dependencies": [
+            {"service": "web", "depends_on": "api"},
+            {"service": "api", "depends_on": "auth"},
+            {"service": "api", "depends_on": "db"},
+            {"service": "auth", "depends_on": "db"},
+        ],
+        "max_concurrency": 2,
+        "fault_domains": [{"domain": "az-a", "services": ["db", "cache"]}],
+    }
+    plan = _create_plan(client, payload)
+    assert [w["services"] for w in plan["waves"]] == [
+        ["db"],
+        ["auth"],
+        ["api"],
+        ["cache", "web"],
+    ]
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+    critical = {x["service"]: x for x in body["critical_services"]}
+    # cache is not downstream of db over dependency edges — they only share
+    # a fault domain — so it is absent from db's constrained downstream.
+    assert critical["db"]["constrained_downstream"] == ["api", "auth", "web"]
+    assert critical["auth"]["constrained_downstream"] == ["api", "web"]
+    assert critical["api"]["constrained_downstream"] == ["web"]
+    assert critical["cache"]["constrained_downstream"] == []
+    assert critical["web"]["constrained_downstream"] == []
+
+
+def test_slack_report_missing_plan_is_404(client):
+    r = client.get("/plans/9999/slack-report")
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"] == "not_found"
+    issue = body["issues"][0]
+    assert issue["code"] == "plan_not_found"
+    assert issue["context"] == {"id": 9999}
+
+
+def test_slack_report_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    before = client.get("/plans").json()["total"]
+    assert client.get(f"/plans/{plan['id']}/slack-report").status_code == 200
+    assert client.get("/plans").json()["total"] == before
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_slack_report_is_deterministic(client):
+    plan = _create_plan(client)
+    responses = [
+        client.get(f"/plans/{plan['id']}/slack-report").json() for _ in range(3)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+
+
+def test_slack_report_works_for_imported_bundle(client):
+    # Imported plans store waves verbatim; the report must still analyze them.
+    plan = _create_plan(client)
+    bundle = client.get(f"/plans/{plan['id']}/bundle").json()
+    imported = client.post("/plans/import", json=bundle)
+    assert imported.status_code in (200, 201)
+    new_id = imported.json()["id"]
+    body = client.get(f"/plans/{new_id}/slack-report").json()
+    assert body["plan_id"] == new_id
+    assert [s["service"] for s in body["services"]] == ["a", "b", "c", "d"]
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+
+
+# ---------------------------------------------------------------------------
 # POST /plans/{id}/gate
 # ---------------------------------------------------------------------------
 

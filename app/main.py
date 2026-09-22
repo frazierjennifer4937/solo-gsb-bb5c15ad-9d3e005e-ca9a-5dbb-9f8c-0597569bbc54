@@ -24,6 +24,7 @@ from .gate import evaluate_gate
 from .planner import plan_release, simulate_plan
 from .rollback import preview_rollback
 from .schemas import (
+    CriticalService,
     ErrorBody,
     GateBlockedItem,
     GateRequest,
@@ -40,12 +41,14 @@ from .schemas import (
     PlanSummary,
     RollbackPreview,
     RollbackPreviewRequest,
+    ServiceSlack,
     ServiceWaveChange,
+    SlackReport,
     TimelineAuditRequest,
     TimelineAuditResult,
     Wave,
 )
-
+from .slack import compute_slack
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -66,7 +69,8 @@ app = FastAPI(
         "of a rollout against completed and failed services, preview "
         "minimum rollback waves for the currently deployed services, "
         "audit the actual per-service execution timeline against the stored "
-        "waves and dependency DAG, and offline-archive/restore complete "
+        "waves and dependency DAG, report per-service wave slack (float) of "
+        "the stored minimum-wave plan, and offline-archive/restore complete "
         "plans as content-addressed (SHA-256) JSON bundles."
     ),
     lifespan=lifespan,
@@ -283,6 +287,76 @@ def get_plan(
     if row is None:
         return _plan_not_found(plan_id)  # type: ignore[return-value]
     return _row_to_result(row)
+
+
+@app.get(
+    "/plans/{plan_id}/slack-report",
+    response_model=SlackReport,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}},
+)
+def get_plan_slack_report(
+    plan_id: int, conn: sqlite3.Connection = Depends(db.get_db)
+) -> SlackReport:
+    """Read-only per-service wave slack of the stored minimum-wave plan.
+
+    For every service the same deterministic CP-SAT solver used for
+    planning maximizes its wave while the horizon stays fixed at the
+    stored (minimum) wave count and every dependency, per-wave
+    concurrency and fault-domain constraint keeps holding; the gap to
+    the service's stored wave is how many waves it can move backwards.
+    Zero-slack services are reported as critical, together with the
+    zero-slack downstream services constrained by them over tight
+    dependency edges. The stored plan is read but never modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_members = [list(wave["services"]) for wave in stored["waves"]]
+    edges = [(d["service"], d["depends_on"]) for d in stored["dependencies"]]
+    domains = stored["fault_domains"]
+    concurrency = stored["max_concurrency"]
+
+    output = compute_slack(
+        services,
+        edges,
+        domains,
+        concurrency,
+        wave_members,
+        app.state.settings,
+    )
+
+    wave_of = {
+        service: wave["index"]
+        for wave in stored["waves"]
+        for service in wave["services"]
+    }
+    return SlackReport(
+        plan_id=row["id"],
+        name=row["name"],
+        wave_count=output.wave_count,
+        optimal=output.optimal,
+        services=[
+            ServiceSlack(
+                service=item.service,
+                wave=item.wave,
+                latest_wave=item.latest_wave,
+                slack_waves=item.slack,
+            )
+            for item in output.services
+        ],
+        critical_services=[
+            CriticalService(
+                service=service,
+                wave=wave_of[service],
+                constrained_downstream=output.constrained_downstream[service],
+            )
+            for service in output.critical
+        ],
+    )
 
 
 @app.delete(

@@ -464,6 +464,68 @@ class TimelineAuditResult(BaseModel):
     )
 
 
+# ---- Service slack report --------------------------------------------------
+
+
+class ServiceSlack(BaseModel):
+    """One service's wave-level slack within the stored minimum-wave plan."""
+
+    service: str = Field(..., description="Service id of the stored plan")
+    wave: int = Field(
+        ..., ge=1, description="Stored wave of the service (1-based)"
+    )
+    latest_wave: int = Field(
+        ...,
+        ge=1,
+        description="Latest wave the service can move to without adding a "
+        "wave or violating any dependency, concurrency or fault-domain "
+        "constraint (1-based)",
+    )
+    slack_waves: int = Field(
+        ...,
+        ge=0,
+        description="Maximum number of waves the service can move backwards "
+        "(later): latest_wave - wave; 0 means the service is critical",
+    )
+
+
+class CriticalService(BaseModel):
+    """A zero-slack service and the critical downstream it constrains."""
+
+    service: str = Field(..., description="Zero-slack (critical) service id")
+    wave: int = Field(..., ge=1, description="Stored wave of the service (1-based)")
+    constrained_downstream: list[str] = Field(
+        ...,
+        description="Zero-slack services reachable from this service over "
+        "dependency edges that are tight (exactly one stored wave apart), "
+        "i.e. the critical-chain continuation constrained by it; sorted",
+    )
+
+
+class SlackReport(BaseModel):
+    """Read-only per-service slack report; never persisted."""
+
+    plan_id: int
+    name: str | None
+    wave_count: int = Field(
+        ..., description="Stored plan wave count; the report never adds a wave"
+    )
+    optimal: bool = Field(
+        ...,
+        description="True when every per-service latest-wave maximum was "
+        "proven optimal by the solver; False after a time limit means some "
+        "slack_waves values may be conservative lower bounds",
+    )
+    services: list[ServiceSlack] = Field(
+        ..., description="One slack row per service, sorted by service id"
+    )
+    critical_services: list[CriticalService] = Field(
+        ...,
+        description="Services with slack_waves == 0, with the zero-slack "
+        "downstream constrained by each; sorted by service id",
+    )
+
+
 # ---- Error envelope --------------------------------------------------------
 
 
